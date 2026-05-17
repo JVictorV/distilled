@@ -373,6 +373,39 @@ function openApiTypeToEffectSchema(
   // scalar), resolve and pass through directly so we don't lose the type.
   // Otherwise merge object schemas.
   if (prop.allOf && prop.allOf.length > 0) {
+    // Some specs use a 2-entry allOf where the first is a $ref and the
+    // second only carries metadata (nullable, description) — e.g.
+    //   allOf:
+    //     - $ref: '#/components/schemas/FileTypeEnum'
+    //     - nullable: true
+    //       description: ...
+    // Treat marker-only entries as metadata on the surviving entry so the
+    // nullability and description survive into the generated schema.
+    const isMarkerOnly = (s: SchemaObject): boolean =>
+      !s.$ref &&
+      !s.type &&
+      !s.enum &&
+      !s.properties &&
+      !s.allOf &&
+      !s.oneOf &&
+      !s.anyOf &&
+      !s.items;
+    const substantive = prop.allOf.filter((s) => !isMarkerOnly(s));
+    const markers = prop.allOf.filter(isMarkerOnly);
+    if (substantive.length === 1 && markers.length > 0) {
+      const hoisted: SchemaObject = { ...prop, allOf: [substantive[0]] };
+      for (const m of markers) {
+        if (m.nullable !== undefined && hoisted.nullable === undefined)
+          hoisted.nullable = m.nullable;
+        if (m["x-nullable"] !== undefined && hoisted["x-nullable"] === undefined)
+          hoisted["x-nullable"] = m["x-nullable"];
+        if (m["x-sensitive"] !== undefined && hoisted["x-sensitive"] === undefined)
+          hoisted["x-sensitive"] = m["x-sensitive"];
+        if (m.description && !hoisted.description)
+          hoisted.description = m.description;
+      }
+      return openApiTypeToEffectSchema(hoisted, spec, indent, seenRefs, ctx);
+    }
     if (prop.allOf.length === 1) {
       let resolved = prop.allOf[0];
       if (resolved.$ref) {
@@ -401,10 +434,22 @@ function openApiTypeToEffectSchema(
     const mergedProps: Record<string, SchemaObject> = {};
     const mergedRequired: string[] = [];
 
-    for (const subSchema of prop.allOf) {
-      let resolved = subSchema;
-      if (subSchema.$ref) {
-        resolved = resolveRef(spec, subSchema.$ref);
+    // Recursively flatten `allOf` chains. A schema like `CreatableProject`
+    // has `allOf: [ModifiableProject, inline]`, and `ModifiableProject` is
+    // itself `allOf: [NonSearchProject, inline]` — a single-level merge
+    // would silently drop NonSearchProject's properties.
+    const flattenInto = (
+      sub: SchemaObject,
+      visited: Set<string>,
+    ): void => {
+      let resolved = sub;
+      if (sub.$ref) {
+        if (visited.has(sub.$ref)) return;
+        visited = new Set([...visited, sub.$ref]);
+        resolved = resolveRef(spec, sub.$ref);
+      }
+      if (resolved.allOf) {
+        for (const inner of resolved.allOf) flattenInto(inner, visited);
       }
       if (resolved.properties) {
         Object.assign(mergedProps, resolved.properties);
@@ -412,6 +457,10 @@ function openApiTypeToEffectSchema(
       if (resolved.required) {
         mergedRequired.push(...resolved.required);
       }
+    };
+
+    for (const subSchema of prop.allOf) {
+      flattenInto(subSchema, new Set(seenRefs));
     }
 
     const mergedSchema: SchemaObject = {
@@ -826,6 +875,7 @@ function generateInputSchema3(
             ? "Schema.Boolean"
             : "Schema.String";
 
+    schemaStr = `${schemaStr}.pipe(T.QueryParam())`;
     if (!param.required) {
       schemaStr = `Schema.optional(${schemaStr})`;
     }
@@ -854,21 +904,32 @@ function generateInputSchema3(
       // Flatten `allOf` so a body schema like `{ allOf: [BranchCreateRequest,
       // AnnotationCreateValueRequest] }` exposes the union of its sub-schemas'
       // properties as fields, instead of degenerating to an empty body.
+      // Recursive — a single-level merge would drop properties from chains
+      // like `CreatableProject` → `ModifiableProject` → `NonSearchProject`.
       if (bodySchema.allOf && bodySchema.allOf.length > 0) {
         const mergedProps: Record<string, SchemaObject> = {
           ...(bodySchema.properties ?? {}),
         };
         const mergedRequired: string[] = [...(bodySchema.required ?? [])];
+        const flatten = (sub: SchemaObject, visited: Set<string>): void => {
+          let resolved = sub;
+          if (sub.$ref) {
+            if (visited.has(sub.$ref)) return;
+            visited = new Set([...visited, sub.$ref]);
+            resolved = resolveRef(spec, sub.$ref) as SchemaObject;
+          }
+          if (resolved.allOf) {
+            for (const inner of resolved.allOf) flatten(inner, visited);
+          }
+          if (resolved.properties) {
+            Object.assign(mergedProps, resolved.properties);
+          }
+          if (resolved.required) {
+            mergedRequired.push(...resolved.required);
+          }
+        };
         for (const subSchema of bodySchema.allOf) {
-          const resolvedSub = subSchema.$ref
-            ? (resolveRef(spec, subSchema.$ref) as SchemaObject)
-            : subSchema;
-          if (resolvedSub.properties) {
-            Object.assign(mergedProps, resolvedSub.properties);
-          }
-          if (resolvedSub.required) {
-            mergedRequired.push(...resolvedSub.required);
-          }
+          flatten(subSchema, new Set());
         }
         bodySchema = {
           ...bodySchema,
